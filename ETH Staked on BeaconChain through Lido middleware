@@ -1,0 +1,134 @@
+/*
+This query calculates:
+    - Lido deposits since 2020-11-03 on a daily basis + cumulative
+    - Other projects deposits since 2020-11-03 on a daily basis + cumulative
+    - All projects deposits since 2020-11-03 on a daily basis + cumulative
+    
+Calculation details:
+    - Gather all deposit and withdrawal txs with project labels:
+        - Get all deposit txs and assign project labels to them (using dune.lido.result_eth_depositors_labels)
+        - Get all withdrawal txs with project labels to them from dune.lido.result_withdrawals_transactions_assigned_to_projects
+    - Calculate ETH deposits for Lido (daily and cumulative)
+    - Calculate Total ETH deposits for all projects (daily and cumulative)
+    - Finally we get a resulting table with daily and cumulative deposits for Lido, Other Projects and Total.
+*/
+
+-- This CTE generates a sequence of dates FROM '2020-11-03' to the current date, with 1-day interval 
+with dates AS (
+    with day_seq AS (
+            SELECT  (
+                SEQUENCE(
+                    CAST('2020-11-03' AS TIMESTAMP)
+                    , CAST(NOW() AS TIMESTAMP)
+                    , INTERVAL '1' day
+                )
+            ) AS day
+        )
+    SELECT  
+    days.day
+    FROM day_seq
+    CROSS JOIN unnest(day) AS days(day)
+ )
+
+-- List of project addresses FROM materialized view 'dune.lido.result_eth_depositors_labels'  
+, project_list AS
+(
+    SELECT  
+        address AS project,
+        name
+        --FROM query_2005642
+    FROM dune.lido.result_eth_depositors_labels
+)
+
+-- 'Lido'
+,selected_project AS
+(SELECT 'Lido' AS name)
+
+-- Get all deposit and withdrawal transactions with project labels
+,all_txns AS
+(
+    SELECT
+      name,
+      date_trunc('day',time) AS time,
+      amount
+    FROM
+      dune.lido.result_deposits_assigned_to_projects
+    
+    UNION all 
+    
+    SELECT  
+        project AS name,
+        date_trunc('day',time) AS time,
+        (-1) * withdrawn_principal AS amount
+    FROM dune.lido.result_withdrawals_transactions_assigned_to_projects 
+    --query_1038304
+    WHERE withdrawn_principal > 0
+)
+
+-- Calculate the daily and cumulative deposits for the Lido project 
+,project_deposits AS (
+SELECT
+    time,
+    lead("time", 1, date_trunc('week',NOW() + interval '7' day)) over (ORDER BY "time") AS next_time,
+    amount AS project_daily_deposits,
+    sum(amount) over (ORDER BY time) AS project_cumulative_deposits
+FROM
+    (
+    SELECT  
+        time,
+        sum(amount) AS amount
+    FROM  all_txns
+    -- Lido
+    WHERE name in (SELECT name FROM selected_project)
+    GROUP BY 1
+    )
+)
+
+-- Calculate the dauly and cumulative deposits for all projects
+,all_deposits AS (
+SELECT
+    time,
+    amount AS total_daily_deposits,
+    sum(amount) over (ORDER BY time) AS total_cumulative_deposits
+FROM
+    (
+        SELECT  
+            time,
+            sum(amount) AS amount
+        FROM  all_txns
+        GROUP BY 1
+    )
+    /*
+    
+    select  time,
+            cum_deposited_eth AS total_cumulative_deposits
+    from query_1933076
+    */
+)
+
+
+-- Calculate daily and cumulative amounts for Lido and Other project 
+SELECT  
+    a.time,
+    total_cumulative_deposits AS total_deposited,
+
+    project_cumulative_deposits AS lido_deposited,
+    total_cumulative_deposits - project_cumulative_deposits AS others,
+    
+    project_cumulative_deposits/total_cumulative_deposits * 100 AS lido_share
+    
+FROM
+(
+    SELECT 
+        d.day AS time,
+        --total_daily_deposits,
+        total_cumulative_deposits,
+        project_daily_deposits,
+        project_cumulative_deposits
+    FROM dates d
+    LEFT JOIN  all_deposits t ON t.time = d.day
+    LEFT JOIN  project_deposits p ON d.day >= p.time AND d.day < p.next_time
+) a
+
+--WHERE time >= date_trunc('month',NOW()) - interval '6' month 
+ORDER BY 1 DESC
